@@ -1,0 +1,409 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  CalculateFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: arn:aws:iam::125708354746:role/LabRole
+      Runtime: python3.8
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import math
+          import os
+          import logging
+          import uuid
+
+          logging.basicConfig(level=logging.INFO)
+          logger = logging.getLogger()
+
+          dynamodb = boto3.client('dynamodb')
+          secretsmanager = boto3.client('secretsmanager')
+          sns = boto3.client('sns')
+
+          def lambda_handler(event, context):
+              logger.info('Received event: %s', json.dumps(event, indent=2))
+
+              body = json.loads(event.get('body', '{}'))
+              operand1 = body.get('operand1')
+              operand2 = body.get('operand2')
+              operation = body.get('operation')
+
+              result = None
+
+              try:
+                  secret_arn = os.environ['SECRET_ARN']
+                  secret_data = secretsmanager.get_secret_value(SecretId=secret_arn)
+                  secrets = json.loads(secret_data['SecretString'])
+                  logger.info('Secrets retrieved successfully')
+
+                  if operation == '+':
+                      result = operand1 + operand2
+                  elif operation == '-':
+                      result = operand1 - operand2
+                  elif operation == '*':
+                      result = operand1 * operand2
+                  elif operation == '/':
+                      result = operand1 / operand2
+                  elif operation == 'sqrt':
+                      result = math.sqrt(operand1)
+                  elif operation == 'log':
+                      result = math.log(operand1)
+                  else:
+                      logger.error('Invalid operation')
+                      return {
+                          'statusCode': 400,
+                          'headers': {
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Methods': 'OPTIONS, POST',
+                              'Access-Control-Allow-Headers': 'Content-Type'
+                          },
+                          'body': json.dumps({'error': 'Invalid operation'})
+                      }
+
+                  logger.info('Calculation result: %s', result)
+
+                  sns_message = f'Calculation result: {result} for operation {operation}'
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Message=sns_message,
+                      Subject='Calculation Result'
+                  )
+                  logger.info('SNS message published successfully')
+
+                  dynamo_params = {
+                      'TableName': os.environ['DYNAMODB_TABLE_NAME'],
+                      'Item': {
+                          'id': {'S': str(uuid.uuid4())},
+                          'operand1': {'S': str(operand1)},
+                          'operand2': {'S': str(operand2)},
+                          'result': {'S': str(result)},
+                          'operation': {'S': operation},
+                          'timestamp': {'S': body.get('timestamp', '')}
+                      }
+                  }
+                  dynamodb.put_item(**dynamo_params)
+                  logger.info('Item added to DynamoDB: %s', dynamo_params['Item'])
+
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Methods': 'OPTIONS, POST',
+                          'Access-Control-Allow-Headers': 'Content-Type'
+                      },
+                      'body': json.dumps({'result': result})
+                  }
+              except Exception as e:
+                  logger.error('Error processing request: %s', str(e))
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Methods': 'OPTIONS, POST',
+                          'Access-Control-Allow-Headers': 'Content-Type'
+                      },
+                      'body': json.dumps({'error': 'Internal Server Error'})
+                  }
+      Environment:
+        Variables:
+          SECRET_ARN: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:my-new-secret-keys
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+          DYNAMODB_TABLE_NAME: CalculationHistory    
+      
+  HistoryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: arn:aws:iam::125708354746:role/LabRole
+      Runtime: python3.8
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+
+          dynamo = boto3.client('dynamodb')
+          secretsmanager = boto3.client('secretsmanager')
+          table_name = os.environ['DYNAMODB_TABLE_NAME']
+
+          def lambda_handler(event, context):
+              print('Received event:', json.dumps(event, indent=2))
+
+              headers = {
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Methods': 'OPTIONS, GET, POST',
+                  'Access-Control-Allow-Headers': 'Content-Type'
+              }
+
+              try:
+                  secret_arn = os.environ['SECRET_ARN']
+                  secret_data = secretsmanager.get_secret_value(SecretId=secret_arn)
+                  secrets = json.loads(secret_data['SecretString'])
+                  
+                  print('Secrets retrieved:', secrets)
+
+                  if 'httpMethod' not in event:
+                      if event.get('operand1') and event.get('operand2') and event.get('result') and event.get('operation') and event.get('timestamp'):
+                          params = {
+                              'TableName': table_name,
+                              'Item': {
+                                  'id': {'S': str(uuid.uuid4())},
+                                  'operand1': {'S': str(event.get('operand1'))},
+                                  'operand2': {'S': str(event.get('operand2'))},
+                                  'result': {'S': str(event.get('result'))},
+                                  'operation': {'S': event.get('operation')},
+                                  'timestamp': {'S': event.get('timestamp')}
+                              }
+                          }
+                          dynamo.put_item(**params)
+                          print('Item added to DynamoDB:', params['Item'])
+                          return {
+                              'statusCode': 200,
+                              'headers': headers,
+                              'body': json.dumps({'message': 'History saved'})
+                          }
+                      else:
+                          return {
+                              'statusCode': 400,
+                              'headers': headers,
+                              'body': json.dumps({'error': 'Missing required fields'})
+                          }
+
+                  if event['httpMethod'] == 'OPTIONS':
+                      return {
+                          'statusCode': 200,
+                          'headers': headers
+                      }
+
+                  if event['httpMethod'] == 'GET':
+                      print('GET request received')
+                      params = {'TableName': table_name}
+                      data = dynamo.scan(**params)
+                      print('Data retrieved from DynamoDB:', data)
+                      return {
+                          'statusCode': 200,
+                          'headers': headers,
+                          'body': json.dumps(data['Items'])
+                      }
+                  elif event['httpMethod'] == 'POST':
+                      print('POST request received')
+                      body = json.loads(event.get('body', '{}'))
+                      operand1 = body.get('operand1')
+                      operand2 = body.get('operand2')
+                      result = body.get('result')
+                      operation = body.get('operation')
+                      timestamp = body.get('timestamp')
+
+                      if not all([operand1, operand2, result, operation, timestamp]):
+                          return {
+                              'statusCode': 400,
+                              'headers': headers,
+                              'body': json.dumps({'error': 'Missing required fields'})
+                          }
+
+                      params = {
+                          'TableName': table_name,
+                          'Item': {
+                              'id': {'S': str(uuid.uuid4())},
+                              'operand1': {'S': str(operand1)},
+                              'operand2': {'S': str(operand2)},
+                              'result': {'S': str(result)},
+                              'operation': {'S': operation},
+                              'timestamp': {'S': timestamp}
+                          }
+                      }
+                      dynamo.put_item(**params)
+                      print('Item added to DynamoDB:', params['Item'])
+                      return {
+                          'statusCode': 200,
+                          'headers': headers,
+                          'body': json.dumps({'message': 'History saved'})
+                      }
+                  else:
+                      return {
+                          'statusCode': 405,
+                          'headers': headers,
+                          'body': json.dumps({'error': 'Method Not Allowed'})
+                      }
+              except secretsmanager.exceptions.ResourceNotFoundException as e:
+                  print('Secret not found:', str(e))
+                  return {
+                      'statusCode': 404,
+                      'headers': headers,
+                      'body': json.dumps({'error': 'Secret not found'})
+                  }
+              except Exception as e:
+                  print('Error processing request:', str(e))
+                  return {
+                      'statusCode': 500,
+                      'headers': headers,
+                      'body': json.dumps({'error': 'Internal Server Error'})
+                  }
+      Environment:
+        Variables:
+          SECRET_ARN: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:my-new-secret-keys
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+          DYNAMODB_TABLE_NAME: CalculationHistory   
+          
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "Calculation Notifications"
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint: shifaamirza09@gmail.com
+      TopicArn: !Ref NotificationTopic
+
+  CalculationHistoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      TableName: CalculationHistory
+
+  ApiGatewayRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: CalculatorApi
+
+  ApiGatewayResourceCalculate:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGatewayRestApi.RootResourceId
+      PathPart: calculate
+      RestApiId: !Ref ApiGatewayRestApi
+
+  ApiGatewayResourceHistory:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGatewayRestApi.RootResourceId
+      PathPart: history
+      RestApiId: !Ref ApiGatewayRestApi
+
+  ApiGatewayMethodCalculate:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      ResourceId: !Ref ApiGatewayResourceCalculate
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CalculateFunction.Arn}/invocations"
+          - { Region: !Ref "AWS::Region" }
+        Credentials: arn:aws:iam::125708354746:role/LabRole
+
+  ApiGatewayMethodCalculateOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      ResourceId: !Ref ApiGatewayResourceCalculate
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        Type: MOCK
+        IntegrationHttpMethod: OPTIONS
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'*'"
+            method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+
+  ApiGatewayMethodHistory:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: GET
+      ResourceId: !Ref ApiGatewayResourceHistory
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${HistoryFunction.Arn}/invocations"
+          - { Region: !Ref "AWS::Region" }
+        Credentials: arn:aws:iam::125708354746:role/LabRole
+
+  ApiGatewayMethodHistoryOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      ResourceId: !Ref ApiGatewayResourceHistory
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        Type: MOCK
+        IntegrationHttpMethod: OPTIONS
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'*'"
+            method.response.header.Access-Control-Allow-Methods: "'OPTIONS,GET'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiGatewayMethodCalculate
+      - ApiGatewayMethodCalculateOptions
+      - ApiGatewayMethodHistory
+      - ApiGatewayMethodHistoryOptions
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      StageName: deployment
+  
+  MyEC2Instance:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      InstanceType: 't2.micro'
+      KeyName: 'my-term-project-key-pair'
+      ImageId: 'ami-0ba9883b710b05ac6'   
+      SecurityGroupIds:
+        - !Ref MySecurityGroup
+      Tags:
+        - Key: Name
+          Value: my-term-project-ec2
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y httpd
+          systemctl start httpd
+          systemctl enable httpd
+          echo "ProxyPass / http://my-frontend-project-bucket.s3-website-us-east-1.amazonaws.com/" >> /etc/httpd/conf/httpd.conf
+          echo "ProxyPassReverse / http://my-frontend-project-bucket.s3-website-us-east-1.amazonaws.com/" >> /etc/httpd/conf/httpd.conf
+          systemctl restart httpd
+  MySecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: 'Enable SSH and HTTP access'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '22'
+          ToPort: '22'
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: tcp
+          FromPort: '80'
+          ToPort: '80'
+          CidrIp: '0.0.0.0/0'
